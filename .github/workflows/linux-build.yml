@@ -17,6 +17,9 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_TERM_COLOR: always
+      # linuxdeploy runs as an AppImage; on headless runners extract instead of
+      # mounting (no FUSE available).
+      APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
       # Same layout as the local monorepo: desktop/ + backend/ + frontend/.
       - uses: actions/checkout@v4
@@ -48,7 +51,12 @@ jobs:
             libwebkit2gtk-4.1-dev \
             build-essential curl wget file \
             libxdo-dev libssl-dev libayatana-appindicator3-dev \
-            librsvg2-dev patchelf pkg-config
+            librsvg2-dev patchelf pkg-config \
+            libfuse2t64
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
 
       - name: Install tauri-cli
         run: cargo install tauri-cli --version "^2" --locked
