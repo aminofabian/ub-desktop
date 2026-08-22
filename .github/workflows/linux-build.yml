@@ -77,14 +77,12 @@ jobs:
         working-directory: desktop
         run: bash scripts/prepare-linux-resources.sh
 
-      - name: Build AppImage + deb
+      - name: Build .deb package
         working-directory: desktop/src-tauri
-        run: cargo tauri build --bundles appimage,deb
+        run: cargo tauri build --bundles deb
 
-      - name: Upload Linux installers
+      - name: Upload Linux installer
         uses: actions/upload-artifact@v4
         with:
           name: kiosk-desktop-linux
-          path: |
-            desktop/src-tauri/target/release/bundle/appimage/*.AppImage
-            desktop/src-tauri/target/release/bundle/deb/*.deb
+          path: desktop/src-tauri/target/release/bundle/deb/*.deb

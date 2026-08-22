@@ -4,7 +4,7 @@
     "beforeBuildCommand": "bash scripts/prepare-linux-resources.sh || bash ../scripts/prepare-linux-resources.sh"
   },
   "bundle": {
-    "targets": ["appimage", "deb"],
+    "targets": ["deb"],
     "resources": {
       "Resources-linux/": "resources/"
     }
