@@ -179,9 +179,13 @@ if [ "$BUILD_MACOS" = 1 ]; then
   say "6/7  macOS app + dmg (host arch — aarch64)"
   [ "$(uname)" = "Darwin" ] || die "--macos requires building on macOS"
   # Same EACCES trap as the Windows step, but tauri-build stages the macOS
-  # copies directly under target/release/{jre,mariadb,jar} — clear them so
-  # this (and the next) build can overwrite the read-only files.
-  rm -rf "$SRC"/target/release/jre "$SRC"/target/release/mariadb "$SRC"/target/release/jar 2>/dev/null || true
+  # copies directly under target/release/{jre,mariadb,jar} and copies them
+  # (read-only) into the crate's build output dir — clear all of them so this
+  # (and the next) build can overwrite the read-only files.
+  rm -rf "$SRC"/target/release/jre "$SRC"/target/release/mariadb \
+    "$SRC"/target/release/jar \
+    "$SRC"/target/release/build/kiosk-desktop-*/out \
+    "$SRC"/target/release/bundle/dmg 2>/dev/null || true
   (cd "$SRC" && cargo tauri build)
   MAC_DMG="$(ls -t "$SRC"/target/release/bundle/dmg/*.dmg 2>/dev/null | head -1)"
   [ -n "$MAC_DMG" ] && [ -f "$MAC_DMG" ] || die "macOS dmg not produced"
