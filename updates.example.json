@@ -1,0 +1,15 @@
+{
+  "version": "0.0.1",
+  "notes": "Desktop auto-update manifest (Tauri updater §13). Host this JSON over HTTPS.",
+  "pub_date": "2026-05-27T00:00:00Z",
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": "BASE64_SIGNATURE_FROM_TAURI_SIGNER",
+      "url": "https://releases.example.com/palmart_0.0.1_aarch64.app.tar.gz"
+    },
+    "darwin-x86_64": {
+      "signature": "BASE64_SIGNATURE_FROM_TAURI_SIGNER",
+      "url": "https://releases.example.com/palmart_0.0.1_x64.app.tar.gz"
+    }
+  }
+}

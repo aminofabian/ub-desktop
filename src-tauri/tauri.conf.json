@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Kiosk",
+  "version": "0.0.7",
+  "identifier": "com.palmart.desktop",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "bash scripts/prepare-tauri-resources.sh || bash ../scripts/prepare-tauri-resources.sh",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null,
+      "dangerousDisableAssetCspModification": true,
+      "capabilities": [
+        "default"
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "category": "Business",
+    "shortDescription": "Kiosk POS for desktop",
+    "longDescription": "Kiosk, the offline-first POS for shops. Runs entirely on the cashier's PC — bundles its own database, Java runtime, and UI.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "copyright": "© Palmart",
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "exceptionDomain": "127.0.0.1",
+      "signingIdentity": null,
+      "entitlements": "../entitlements/macos/entitlements.plist"
+    }
+  }
+}

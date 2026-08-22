@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/macOS-schema.json",
+  "identifier": "default",
+  "description": "Default capability set for the main window — only what the loading shell + remote UI need.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-close",
+    "core:webview:allow-create-webview-window"
+  ]
+}
