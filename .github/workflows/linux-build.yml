@@ -1,0 +1,80 @@
+name: Build Linux desktop
+
+# Linux bundles can't be cross-compiled from macOS, so the AppImage + deb are
+# built on an ubuntu runner. Run manually from Actions → "Build Linux desktop".
+# The installers come back as a downloadable artifact; publish them to the
+# release (and the site manifest) with the normal flow afterwards:
+#
+#   gh run download <run> -n kiosk-desktop-linux
+#   gh release upload desktop-v<version> kiosk-desktop-* --repo aminofabian/ub-front --clobber
+#   cd frontend && DESKTOP_DOWNLOAD_BASE_URL=... bun run pack:desktop-downloads
+#
+on:
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      # Same layout as the local monorepo: desktop/ + backend/ + frontend/.
+      - uses: actions/checkout@v4
+        with:
+          path: desktop
+      - uses: actions/checkout@v4
+        with:
+          repository: aminofabian/ub
+          path: backend
+      - uses: actions/checkout@v4
+        with:
+          repository: aminofabian/ub-front
+          path: frontend
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install system deps (Tauri v2 Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf pkg-config
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Frontend static export (bundled into the JAR)
+        working-directory: frontend
+        run: |
+          bun install
+          bun run build:desktop
+
+      - name: Backend bootJar (desktop profile)
+        working-directory: backend
+        run: ./gradlew bootJar -Pdesktop=true --no-daemon
+
+      - name: Stage Linux resources (JRE + MariaDB + jar)
+        working-directory: desktop
+        run: bash scripts/prepare-linux-resources.sh
+
+      - name: Build AppImage + deb
+        working-directory: desktop/src-tauri
+        run: cargo tauri build --bundles appimage,deb
+
+      - name: Upload Linux installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiosk-desktop-linux
+          path: |
+            desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+            desktop/src-tauri/target/release/bundle/deb/*.deb

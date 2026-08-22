@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "bash scripts/prepare-linux-resources.sh || bash ../scripts/prepare-linux-resources.sh"
+  },
+  "bundle": {
+    "targets": ["appimage", "deb"],
+    "resources": {
+      "Resources-linux/": "resources/"
+    }
+  }
+}

@@ -2,6 +2,7 @@
 src-tauri/target/
 src-tauri/Resources/
 src-tauri/Resources-windows/
+src-tauri/Resources-linux/
 src-tauri/bundle/
 src-tauri/gen/
 .cache/
