@@ -3,7 +3,7 @@ name = "kiosk-desktop"
 # Keep in sync with src-tauri/tauri.conf.json — release.sh bumps both. The
 # shell's kiosk.log prints this version, so a stale value here makes support
 # logs claim the wrong release.
-version = "0.0.13"
+version = "0.0.14"
 description = "Palmart for desktop — thin Tauri shell over Spring Boot + MariaDB."
 authors = ["Palmart"]
 license = "Proprietary"
