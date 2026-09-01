@@ -59,6 +59,23 @@ cfg["version"] = v
 json.dump(cfg, open(p, "w"), indent=2, ensure_ascii=False)
 PY
 fi
+# Keep the crate version in lockstep — kiosk.log prints CARGO_PKG_VERSION, so
+# a stale Cargo.toml makes every support log claim the wrong release.
+CARGO_VERSION="$(python3 -c "
+import re
+src = open('$SRC/Cargo.toml').read()
+m = re.search(r'^version = \"([^\"]+)\"', src, re.M)
+print(m.group(1) if m else '')")"
+if [ -n "$CARGO_VERSION" ] && [ "$CARGO_VERSION" != "$VERSION" ]; then
+  echo "  bumping Cargo.toml version: $CARGO_VERSION → $VERSION"
+  python3 - "$SRC/Cargo.toml" "$VERSION" <<'PY'
+import re, sys
+p, v = sys.argv[1], sys.argv[2]
+src = open(p).read()
+src = re.sub(r'^(version\s*=\s*)\"[^\"]+\"', r'\g<1>"' + v + '"', src, count=1, flags=re.M)
+open(p, 'w').write(src)
+PY
+fi
 RELEASE_TAG="desktop-v$VERSION"
 GH_REPO="${GITHUB_REPO:-$(git -C "$FRONTEND" remote get-url origin 2>/dev/null | sed -nE 's#.*github.com[:/]([^/]+/[^/.]+)(\.git)?$#\1#p')}"
 
