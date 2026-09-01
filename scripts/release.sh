@@ -186,6 +186,12 @@ if [ "$BUILD_MACOS" = 1 ]; then
     "$SRC"/target/release/jar \
     "$SRC"/target/release/build/kiosk-desktop-*/out \
     "$SRC"/target/release/bundle/dmg 2>/dev/null || true
+  # A previous failed DMG attempt can leave its rw.* temp image mounted
+  # (hdiutil then can't unmount the next attempt: "Resource busy"). Detach
+  # any strays before bundling.
+  for v in /Volumes/dmg.*; do
+    [ -d "$v" ] && hdiutil detach "$v" -force >/dev/null 2>&1 || true
+  done
   (cd "$SRC" && cargo tauri build)
   MAC_DMG="$(ls -t "$SRC"/target/release/bundle/dmg/*.dmg 2>/dev/null | head -1)"
   [ -n "$MAC_DMG" ] && [ -f "$MAC_DMG" ] || die "macOS dmg not produced"
