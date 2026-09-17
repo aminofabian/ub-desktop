@@ -82,7 +82,14 @@ pub fn run() {
 
     tauri::Builder::default()
         // Second launch → focus the running instance instead of double-booting.
+        // The log line matters: the second process logs "Kiosk Desktop starting"
+        // before reaching this plugin (see init_logging above), so without it the
+        // log shows two startups and no explanation — which looked like the app
+        // double-booting (kiosk.log 2026-08-22T11:44:21Z).
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            log::info!(
+                "Second launch detected — the running instance keeps the ports; focusing its window."
+            );
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_focus();
             }
