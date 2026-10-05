@@ -100,6 +100,28 @@
         color: var(--muted);
         line-height: 1.55;
       }
+      .actions {
+        display: none;
+        margin-top: 20px;
+        gap: 10px;
+        justify-content: center;
+      }
+      .actions.visible {
+        display: flex;
+      }
+      button {
+        font: inherit;
+        font-size: 13px;
+        color: var(--text);
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 9px;
+        padding: 9px 16px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: rgba(255, 255, 255, 0.1);
+      }
     </style>
   </head>
   <body>
@@ -140,20 +162,43 @@
           log file listed above for details.
         </p>
       </div>
+
+      <div class="actions" id="actions">
+        <button id="quit" type="button">Quit Kiosk</button>
+      </div>
     </div>
 
     <script>
-      // The Rust shell navigates back to this page with `?error=…` when
-      // MariaDB or the backend fails to start, so the failure is visible on
-      // every platform instead of a dead, blank window.
+      // The Rust shell drives this page with query params:
+      //   ?error=…      MariaDB/backend failed to start, or the backend kept
+      //                 stopping through every auto-restart attempt.
+      //   ?restarting=x  The post-boot watchdog detected the backend stopped
+      //                 and is restarting the stack (attempt x), or the user
+      //                 asked for a restart from Settings (x = "manual").
+      // Everything renders in-page so failures are visible on every platform
+      // without a blank window or any IPC.
       (function () {
-        var err = new URLSearchParams(window.location.search).get("error");
+        var params = new URLSearchParams(window.location.search);
+        var err = params.get("error");
+        var restarting = params.get("restarting");
         if (err) {
           document.getElementById("spinner").classList.add("hidden");
           document.getElementById("error").style.display = "block";
           document.getElementById("errorMsg").textContent = err;
+          document.getElementById("actions").classList.add("visible");
           document.title = "Kiosk — couldn't start";
+        } else if (restarting) {
+          var detail =
+            restarting === "manual"
+              ? "Your data is safe &mdash; this takes a few seconds."
+              : "Attempt " + restarting + ". This usually takes a moment.";
+          document.getElementById("subtitle").innerHTML =
+            "The till backend is restarting&hellip;<br />" + detail;
+          document.title = "Kiosk — restarting";
         }
+        document.getElementById("quit").addEventListener("click", function () {
+          window.close();
+        });
       })();
     </script>
   </body>

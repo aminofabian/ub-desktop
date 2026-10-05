@@ -24,7 +24,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder};
 
 mod backend;
@@ -49,6 +49,10 @@ pub struct AppState {
     /// the boot thread bails out at its next checkpoint instead of spawning
     /// more processes into a dying app.
     pub abort: AtomicBool,
+    /// Set by the device bridge's `POST /restart` (Settings → Desktop). The
+    /// health watchdog consumes it and boots the stack again without counting
+    /// against the auto-restart budget. `Arc` so the sidecar thread can set it.
+    pub restart_requested: Arc<AtomicBool>,
 }
 
 pub fn run() {
@@ -74,6 +78,7 @@ pub fn run() {
         backend: Mutex::new(None),
         mariadb: Mutex::new(None),
         abort: AtomicBool::new(false),
+        restart_requested: Arc::new(AtomicBool::new(false)),
     });
 
     let supervisor_for_boot = Arc::clone(&supervisor);
@@ -112,9 +117,14 @@ pub fn run() {
             .build()?;
             window.set_focus().ok();
 
+            // Capture the splash URL before the boot thread navigates away, so
+            // the watchdog can route back to it for restart / terminal-error
+            // states (the window is on the backend URL by then).
+            let splash_url = window.url().ok();
+
             let handle = app.handle().clone();
             std::thread::spawn(move || {
-                boot_stack(supervisor_for_boot, state_for_boot, handle)
+                supervise(supervisor_for_boot, state_for_boot, handle, splash_url)
             });
             Ok(())
         })
@@ -129,17 +139,24 @@ pub fn run() {
         });
 }
 
-/// Start MariaDB + the JVM off the main thread. Stores each child in
-/// [`AppState`] the moment it is spawned; on success navigates the window to
-/// the backend URL, on failure cleans up and surfaces the error on the splash
-/// page (plus a native alert on Windows).
-fn boot_stack(supervisor: Arc<Supervisor>, state: Arc<AppState>, app: AppHandle) {
-    // ESC/POS bridge runs on a sidecar thread. Wait briefly for its first
-    // bind outcome so a busy port (typically a stray instance from a previous
-    // session) is reported loudly instead of a silently missing printer
-    // bridge. The thread keeps retrying in the background while the stack
-    // boots (devices.rs `BIND_RETRY_WINDOW`).
-    let device_status = devices::start_device_server(supervisor.app_data().to_path_buf());
+/// Supervise the till for the life of the app: start the stack, watch it, and
+/// restart it (bounded) if the backend stops.
+///
+/// The ESC/POS bridge is started once here, outside the boot loop, so a backend
+/// restart never tries to rebind port 19500.
+fn supervise(
+    supervisor: Arc<Supervisor>,
+    state: Arc<AppState>,
+    app: AppHandle,
+    splash_url: Option<Url>,
+) {
+    // ESC/POS bridge runs on a sidecar thread. Wait briefly for its first bind
+    // outcome so a busy port (typically a stray instance from a previous
+    // session) is reported loudly instead of a silently missing printer bridge.
+    let device_status = devices::start_device_server(
+        supervisor.app_data().to_path_buf(),
+        Arc::clone(&state.restart_requested),
+    );
     match devices::wait_for_bridge_bind(&device_status, Duration::from_secs(2)) {
         devices::BridgeStatus::Ready => {}
         devices::BridgeStatus::Failed(msg) => log::error!("Device bridge unavailable: {msg}"),
@@ -150,6 +167,181 @@ fn boot_stack(supervisor: Arc<Supervisor>, state: Arc<AppState>, app: AppHandle)
         ),
     }
 
+    let mut restarts: u32 = 0;
+    loop {
+        match boot_stack(
+            Arc::clone(&supervisor),
+            Arc::clone(&state),
+            app.clone(),
+            &device_status,
+            splash_url.as_ref(),
+        ) {
+            BootOutcome::Healthy => {}
+            // boot_stack already surfaced the failure on the splash page, and a
+            // boot failure (port busy, jar missing) won't fix itself by retrying.
+            BootOutcome::Failed | BootOutcome::Cancelled => return,
+        }
+
+        match watch_health(&supervisor, &state) {
+            WatchOutcome::Aborted => return,
+            WatchOutcome::Down => {
+                if aborted(&state) {
+                    return;
+                }
+                if restarts >= MAX_RESTARTS {
+                    log::error!("Backend stopped {restarts} times without recovering — giving up.");
+                    surface_splash(
+                        &app,
+                        splash_url.as_ref(),
+                        &[(
+                            "error",
+                            format!(
+                                "The till backend keeps stopping.\n\nQuit Kiosk and open \
+                                 it again. If this repeats, send the log file to \
+                                 support:\n{}/kiosk.log",
+                                supervisor.app_data().display()
+                            ),
+                        )],
+                    );
+                    return;
+                }
+                restarts += 1;
+                log::warn!("Backend stopped — restarting (attempt {restarts}/{MAX_RESTARTS}).");
+                surface_splash(
+                    &app,
+                    splash_url.as_ref(),
+                    &[("restarting", format!("{restarts}/{MAX_RESTARTS}"))],
+                );
+                shutdown_children(&state, &supervisor);
+                wait_for_ports_free(&supervisor);
+            }
+            // A deliberate restart from Settings: reboot the stack without
+            // spending the auto-restart budget (this is not a failure).
+            WatchOutcome::RestartRequested => {
+                log::info!("Restart requested from Settings — rebooting the till backend.");
+                surface_splash(&app, splash_url.as_ref(), &[("restarting", "manual".into())]);
+                shutdown_children(&state, &supervisor);
+                wait_for_ports_free(&supervisor);
+            }
+        }
+    }
+}
+
+/// Bounded auto-restart attempts before the shell gives up on the terminal
+/// error screen.
+const MAX_RESTARTS: u32 = 3;
+/// How often the watchdog probes `/actuator/health` once the till is up.
+const HEALTH_POLL: Duration = Duration::from_secs(10);
+/// Consecutive failed probes before the backend is treated as down (~20 s) —
+/// long enough to ride out one slow request, short enough to matter.
+const HEALTH_FAILURES_BEFORE_RESTART: u32 = 2;
+
+enum WatchOutcome {
+    /// The app is exiting; stop watching.
+    Aborted,
+    /// The backend stopped responding.
+    Down,
+    /// Settings → Desktop asked for a restart via the device bridge.
+    RestartRequested,
+}
+
+/// Poll the backend health until the app exits, the backend stops, or a restart
+/// is requested from the UI.
+fn watch_health(supervisor: &Supervisor, state: &AppState) -> WatchOutcome {
+    let port = supervisor.backend_port();
+    let mut failures: u32 = 0;
+    loop {
+        // Sleep in small slices so an exit or restart request is honoured
+        // promptly (worst case one slice, ~0.5 s).
+        for _ in 0..20 {
+            if aborted(state) {
+                return WatchOutcome::Aborted;
+            }
+            if state.restart_requested.swap(false, Ordering::SeqCst) {
+                return WatchOutcome::RestartRequested;
+            }
+            std::thread::sleep(HEALTH_POLL / 20);
+        }
+        if health_ok(port) {
+            if failures > 0 {
+                log::info!("Backend health recovered after {failures} failed check(s).");
+            }
+            failures = 0;
+        } else {
+            failures += 1;
+            log::warn!("Backend health check failed ({failures}/{HEALTH_FAILURES_BEFORE_RESTART}).");
+            if failures >= HEALTH_FAILURES_BEFORE_RESTART {
+                return WatchOutcome::Down;
+            }
+        }
+    }
+}
+
+/// Live `/actuator/health` probe with a short timeout (never blocks long).
+fn health_ok(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/actuator/health");
+    match ureq::get(&url).timeout(Duration::from_secs(2)).call() {
+        Ok(resp) => resp.status() == 200,
+        Err(_) => false,
+    }
+}
+
+/// Wait for the backend + MariaDB ports to be released after a shutdown so the
+/// next boot's pre-flight check doesn't trip on a lingering socket.
+fn wait_for_ports_free(supervisor: &Supervisor) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let backend_busy = port_is_open("127.0.0.1", supervisor.backend_port());
+        let db_busy = port_is_open("127.0.0.1", supervisor.mariadb_config().port);
+        if !backend_busy && !db_busy {
+            return;
+        }
+        if Instant::now() >= deadline {
+            log::warn!("Ports still busy after shutdown; retrying boot anyway.");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// The result of one boot attempt.
+enum BootOutcome {
+    /// MariaDB + the backend are up and healthy.
+    Healthy,
+    /// Startup failed; the reason is already on the splash page.
+    Failed,
+    /// The user closed the app mid-startup.
+    Cancelled,
+}
+
+/// Navigate the main window back to the splash page with the given query
+/// params (used for the restart and terminal-error states).
+fn surface_splash(app: &AppHandle, splash_url: Option<&Url>, params: &[(&str, String)]) {
+    let Some(base) = splash_url else {
+        log::warn!("Splash URL unavailable; cannot surface a shell state on it.");
+        return;
+    };
+    let mut url = base.clone();
+    url.query_pairs_mut().clear();
+    for (key, value) in params {
+        url.query_pairs_mut().append_pair(key, value);
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.navigate(url);
+    }
+}
+
+/// Start MariaDB + the JVM off the main thread. Stores each child in
+/// [`AppState`] the moment it is spawned; on success navigates the window to
+/// the backend URL, on failure surfaces the error on the splash page (plus a
+/// native alert on Windows).
+fn boot_stack(
+    supervisor: Arc<Supervisor>,
+    state: Arc<AppState>,
+    app: AppHandle,
+    device_status: &Arc<Mutex<devices::BridgeStatus>>,
+    splash_url: Option<&Url>,
+) -> BootOutcome {
     let boot = (|| -> Result<(), BootError> {
         // Fail fast instead of the 90-second death march: if the backend port
         // is already answering, a previous/stray instance is alive and holds
@@ -207,6 +399,7 @@ fn boot_stack(supervisor: Arc<Supervisor>, state: Arc<AppState>, app: AppHandle)
                     let _ = window.navigate(parsed);
                 }
             }
+            BootOutcome::Healthy
         }
         Err(err) => {
             // Clean up whatever is still under our control (no-op for things
@@ -220,7 +413,7 @@ fn boot_stack(supervisor: Arc<Supervisor>, state: Arc<AppState>, app: AppHandle)
 
             if err.cancelled {
                 log::info!("Startup cancelled by exit request.");
-                return;
+                return BootOutcome::Cancelled;
             }
 
             log::error!("Startup failed: {}", err.message);
@@ -232,22 +425,16 @@ fn boot_stack(supervisor: Arc<Supervisor>, state: Arc<AppState>, app: AppHandle)
             // If the printer/cash-drawer bridge also failed to come up, the
             // most likely cause is a stray instance from a previous session —
             // surface that next to the boot error so it can't be missed.
-            if let Some(note) = device_bridge_note(&device_status) {
+            if let Some(note) = device_bridge_note(device_status) {
                 display.push_str(&format!("\n\nDevice bridge: {note}"));
             }
-            // Navigate the splash back to itself with `?error=…` so the page
+            // Route the splash back to itself with `?error=…` so the page
             // renders the failure (works on every platform — no IPC needed).
-            if let Some(window) = app.get_webview_window("main") {
-                if let Ok(mut url) = window.url() {
-                    url.query_pairs_mut()
-                        .clear()
-                        .append_pair("error", &display);
-                    let _ = window.navigate(url);
-                }
-            }
+            surface_splash(&app, splash_url, &[("error", display.clone())]);
             // Windows: also pop a native alert so the failure can't be missed.
             #[cfg(windows)]
             show_error_dialog("Kiosk Desktop", &display);
+            BootOutcome::Failed
         }
     }
 }

@@ -15,6 +15,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -58,6 +59,9 @@ struct PrinterConfig {
     port: u16,
     #[serde(default)]
     path: String,
+    /// CUPS / system queue name when `mode` is `cups`.
+    #[serde(default, alias = "cupsName")]
+    cups_name: String,
 }
 
 fn default_mode() -> String {
@@ -71,11 +75,17 @@ fn default_port() -> u16 {
 /// Spawn the ESC/POS bridge thread and return a handle to its bind status.
 /// Non-blocking: the boot path calls [`wait_for_bridge_bind`] with a short
 /// timeout instead of blocking on the full retry window.
-pub fn start_device_server(app_data: PathBuf) -> Arc<Mutex<BridgeStatus>> {
+///
+/// `restart_flag` is shared with the shell's watchdog: `POST /restart` sets it,
+/// and the supervisor then tears the stack down and boots it again.
+pub fn start_device_server(
+    app_data: PathBuf,
+    restart_flag: Arc<AtomicBool>,
+) -> Arc<Mutex<BridgeStatus>> {
     let status = Arc::new(Mutex::new(BridgeStatus::Starting));
     let status_for_thread = Arc::clone(&status);
     thread::spawn(move || {
-        if let Err(e) = run_server(&app_data, &status_for_thread) {
+        if let Err(e) = run_server(&app_data, &status_for_thread, &restart_flag) {
             log::error!("device server exited: {e}");
         }
     });
@@ -99,7 +109,11 @@ pub fn wait_for_bridge_bind(status: &Mutex<BridgeStatus>, timeout: Duration) -> 
     }
 }
 
-fn run_server(app_data: &Path, status: &Mutex<BridgeStatus>) -> std::io::Result<()> {
+fn run_server(
+    app_data: &Path,
+    status: &Mutex<BridgeStatus>,
+    restart_flag: &AtomicBool,
+) -> std::io::Result<()> {
     let addr = format!("127.0.0.1:{DEVICE_PORT}");
     let listener = bind_with_retry(&addr, status)?;
     log::info!("Device bridge listening on http://{addr}");
@@ -107,7 +121,7 @@ fn run_server(app_data: &Path, status: &Mutex<BridgeStatus>) -> std::io::Result<
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
-                if let Err(e) = handle_client(s, app_data) {
+                if let Err(e) = handle_client(s, app_data, restart_flag) {
                     log::warn!("device request failed: {e}");
                 }
             }
@@ -158,7 +172,11 @@ fn bind_with_retry(addr: &str, status: &Mutex<BridgeStatus>) -> std::io::Result<
     }
 }
 
-fn handle_client(mut stream: TcpStream, app_data: &Path) -> std::io::Result<()> {
+fn handle_client(
+    mut stream: TcpStream,
+    app_data: &Path,
+    restart_flag: &AtomicBool,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let (method, path, body, headers) = read_http_request(&mut stream)?;
 
@@ -168,12 +186,24 @@ fn handle_client(mut stream: TcpStream, app_data: &Path) -> std::io::Result<()> 
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/health") | ("GET", "/health/") => {
-            write_json_response(
-                &mut stream,
-                200,
-                r#"{"ok":true,"cups":true}"#,
-            )
+            let platform = health_platform();
+            let has_lpstat = lpstat_bin().is_some();
+            let json = format!(
+                r#"{{"ok":true,"cups":{cups},"lpstat":{lpstat},"platform":"{platform}","port":{port}}}"#,
+                cups = if has_lpstat { "true" } else { "false" },
+                lpstat = if has_lpstat { "true" } else { "false" },
+                platform = platform,
+                port = DEVICE_PORT,
+            );
+            write_json_response(&mut stream, 200, &json)
         }
+        ("GET", "/printers") | ("GET", "/printers/") => match list_cups_printers_json() {
+            Ok(json) => write_json_response(&mut stream, 200, &json),
+            Err(e) => {
+                log::warn!("list printers failed: {e}");
+                write_response(&mut stream, 500, &e.to_string())
+            }
+        },
         ("POST", "/print") | ("POST", "/print/") => {
             if body.is_empty() {
                 return write_response(&mut stream, 400, "empty body");
@@ -218,12 +248,78 @@ fn handle_client(mut stream: TcpStream, app_data: &Path) -> std::io::Result<()> 
                 }
             }
         }
+        // Settings → Desktop → "Restart backend". The flag is consumed by the
+        // shell's health watchdog, which tears the stack down and boots it
+        // again; the bridge itself keeps listening across the restart.
+        ("POST", "/restart") | ("POST", "/restart/") => {
+            restart_flag.store(true, Ordering::SeqCst);
+            log::info!("Restart requested via the device bridge.");
+            write_json_response(&mut stream, 202, r#"{"restarting":true}"#)
+        }
+        // Settings → Desktop → "Open data folder". Opens APP_DATA in the OS file
+        // manager (the JVM is headless, so it cannot do this itself).
+        ("POST", "/open-data-folder") | ("POST", "/open-data-folder/") => {
+            match open_in_file_manager(app_data) {
+                Ok(()) => write_json_response(&mut stream, 200, r#"{"opened":true}"#),
+                Err(e) => {
+                    log::warn!("open data folder failed: {e}");
+                    write_json_response(
+                        &mut stream,
+                        500,
+                        &format!(r#"{{"opened":false,"error":"{}"}}"#, e),
+                    )
+                }
+            }
+        }
         _ => write_response(&mut stream, 404, "not found"),
     }
 }
 
+/// Open `path` in the OS file manager. Detaches so a long-lived opener never
+/// blocks the bridge thread; a failure to spawn is surfaced to the caller.
+fn open_in_file_manager(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let program = "xdg-open";
+
+    let mut cmd = Command::new(program);
+    cmd.arg(path);
+    // Windows: don't flash a console window for the opener.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.spawn().map(|_| ())
+}
+
 fn header_ci(headers: &HashMap<String, String>, key: &str) -> Option<String> {
     headers.get(key).cloned()
+}
+
+fn health_platform() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "unknown"
+    }
+}
+
+fn lpstat_bin() -> Option<&'static str> {
+    if std::path::Path::new("/usr/bin/lpstat").exists() {
+        Some("/usr/bin/lpstat")
+    } else if std::path::Path::new("/bin/lpstat").exists() {
+        Some("/bin/lpstat")
+    } else {
+        None
+    }
 }
 
 fn is_valid_cups_name(name: &str) -> bool {
@@ -232,6 +328,156 @@ fn is_valid_cups_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+fn is_likely_thermal(name: &str, uri: &str) -> bool {
+    let hay = format!("{name} {uri}").to_ascii_lowercase();
+    const HINTS: &[&str] = &[
+        "caysn",
+        "xprinter",
+        "x-printer",
+        "epson",
+        "tm-",
+        "tm_",
+        "star",
+        "bixolon",
+        "citizen",
+        "pos-80",
+        "pos80",
+        "receipt",
+        "thermal",
+        "rongta",
+        "gprinter",
+        "munbyn",
+        "rp58",
+        "rp80",
+        "xp-",
+    ];
+    HINTS.iter().any(|h| hay.contains(h))
+}
+
+fn is_noise_printer(name: &str, uri: &str) -> bool {
+    let hay = format!("{name} {uri}").to_ascii_lowercase();
+    const NOISE: &[&str] = &[
+        "pdf",
+        "fax",
+        "airprint",
+        "microsoft print to pdf",
+        "onenote",
+        "send to onenote",
+        "microsoft xps",
+    ];
+    NOISE.iter().any(|n| hay.contains(n))
+}
+
+/// JSON shape matches the cloud Till Print Bridge `/printers` response.
+fn list_cups_printers_json() -> std::io::Result<String> {
+    let platform = health_platform();
+    let Some(lpstat) = lpstat_bin() else {
+        return Ok(format!(
+            r#"{{"ok":true,"platform":"{platform}","printers":[],"suggested":null,"defaultName":null}}"#
+        ));
+    };
+
+    let devices = Command::new(lpstat).arg("-v").output()?;
+    let default_out = Command::new(lpstat).arg("-d").output().ok();
+    let devices_text = String::from_utf8_lossy(&devices.stdout);
+    let default_text = default_out
+        .as_ref()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+
+    let default_name = default_text
+        .lines()
+        .find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            let idx = lower.find("system default destination:")?;
+            Some(line[idx + "system default destination:".len()..].trim().to_string())
+        })
+        .filter(|n| !n.is_empty());
+
+    let mut printers: Vec<(String, String, bool, bool)> = Vec::new();
+    for line in devices_text.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed
+            .strip_prefix("device for ")
+            .or_else(|| trimmed.strip_prefix("Device for "))
+        else {
+            continue;
+        };
+        let Some((name, uri)) = rest.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if !is_valid_cups_name(name) {
+            continue;
+        }
+        let uri = uri.trim().to_string();
+        let is_default = default_name.as_deref() == Some(name);
+        let likely = is_likely_thermal(name, &uri) && !is_noise_printer(name, &uri);
+        printers.push((name.to_string(), uri, is_default, likely));
+    }
+
+    printers.sort_by(|a, b| {
+        b.3.cmp(&a.3)
+            .then_with(|| {
+                let a_noise = is_noise_printer(&a.0, &a.1);
+                let b_noise = is_noise_printer(&b.0, &b.1);
+                a_noise.cmp(&b_noise)
+            })
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let suggested = printers
+        .iter()
+        .find(|p| p.3)
+        .or_else(|| {
+            printers
+                .iter()
+                .find(|p| p.2 && !is_noise_printer(&p.0, &p.1))
+        })
+        .or_else(|| {
+            printers
+                .iter()
+                .find(|p| !is_noise_printer(&p.0, &p.1))
+        })
+        .or_else(|| {
+            if printers.len() == 1 {
+                printers.first()
+            } else {
+                None
+            }
+        })
+        .map(|p| p.0.clone());
+
+    let mut arr = String::from("[");
+    for (i, (name, uri, is_default, likely)) in printers.iter().enumerate() {
+        if i > 0 {
+            arr.push(',');
+        }
+        arr.push_str(&format!(
+            r#"{{"name":{},"uri":{},"isDefault":{},"likelyThermal":{}}}"#,
+            serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(uri).unwrap_or_else(|_| "\"\"".into()),
+            if *is_default { "true" } else { "false" },
+            if *likely { "true" } else { "false" },
+        ));
+    }
+    arr.push(']');
+
+    let suggested_json = suggested
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".into()))
+        .unwrap_or_else(|| "null".into());
+    let default_json = default_name
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".into()))
+        .unwrap_or_else(|| "null".into());
+
+    Ok(format!(
+        r#"{{"ok":true,"platform":"{platform}","printers":{arr},"suggested":{suggested_json},"defaultName":{default_json}}}"#
+    ))
 }
 
 fn send_to_cups(name: &str, data: &[u8]) -> std::io::Result<()> {
@@ -402,7 +648,11 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::R
 }
 
 fn write_json_response(stream: &mut TcpStream, status: u16, json: &str) -> std::io::Result<()> {
-    let reason = if status == 200 { "OK" } else { "Error" };
+    let reason = match status {
+        200 => "OK",
+        202 => "Accepted",
+        _ => "Error",
+    };
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          {cors}\
@@ -429,6 +679,7 @@ fn load_config(app_data: &Path) -> PrinterConfig {
             host: String::new(),
             port: 9100,
             path: app_data.join("receipts.log").display().to_string(),
+            cups_name: String::new(),
         };
     }
     match fs::read_to_string(&path) {
@@ -439,6 +690,7 @@ fn load_config(app_data: &Path) -> PrinterConfig {
                 host: String::new(),
                 port: 9100,
                 path: app_data.join("receipts.log").display().to_string(),
+                cups_name: String::new(),
             }
         }),
         Err(_) => PrinterConfig {
@@ -446,6 +698,7 @@ fn load_config(app_data: &Path) -> PrinterConfig {
             host: String::new(),
             port: 9100,
             path: String::new(),
+            cups_name: String::new(),
         },
     }
 }
@@ -471,6 +724,21 @@ fn send_to_printer(app_data: &Path, data: &[u8]) -> std::io::Result<()> {
             stream.flush()?;
             log::info!("sent {} bytes to printer at {addr}", data.len());
             Ok(())
+        }
+        "cups" => {
+            if cfg.cups_name.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "printer.json: cupsName required for cups mode",
+                ));
+            }
+            if !is_valid_cups_name(&cfg.cups_name) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "printer.json: invalid CUPS printer name",
+                ));
+            }
+            send_to_cups(&cfg.cups_name, data)
         }
         "file" | _ => {
             let path = if cfg.path.is_empty() {

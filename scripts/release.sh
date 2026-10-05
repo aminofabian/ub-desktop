@@ -213,6 +213,14 @@ if [ "$BUILD_MACOS" = 1 ]; then
   MAC_DMG="$(ls -t "$SRC"/target/release/bundle/dmg/*.dmg 2>/dev/null | head -1)"
   [ -n "$MAC_DMG" ] && [ -f "$MAC_DMG" ] || die "macOS dmg not produced"
   echo "  → $MAC_DMG"
+  # Sign the .app (hardened runtime) + notarize/staple the .dmg when a
+  # Developer ID is configured. Unsigned builds still work for local testing.
+  if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+    APP_PATH="$(ls -d "$SRC"/target/release/bundle/macos/*.app 2>/dev/null | head -1 || true)"
+    bash "$SCRIPT_DIR/sign-and-notarize-macos.sh" "$MAC_DMG" ${APP_PATH:+"$APP_PATH"}
+  else
+    echo "  code-signing: disabled (set APPLE_SIGNING_IDENTITY to sign + notarize the dmg)"
+  fi
 fi
 
 # ── 7. Move stale loose installers aside ───────────────────────────────────
