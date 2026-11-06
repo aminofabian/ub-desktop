@@ -43,11 +43,18 @@ pub enum BridgeStatus {
     Failed(String),
 }
 
-/// Standard ESC/POS pulse — drawer kick pin 2 then pin 5.
-const DRAWER_KICK: &[u8] = &[
-    0x1b, 0x70, 0x00, 0x19, 0xfa, // pin 2
-    0x1b, 0x70, 0x01, 0x19, 0xfa, // pin 5
-];
+/// Init, both RJ12 pins, two line feeds, NUL-padded to a USB packet.
+/// A 10-byte pulse is dropped by the tills this drawer is plugged into.
+fn drawer_kick_job() -> Vec<u8> {
+    let mut bytes = vec![
+        0x1b, 0x40, // ESC @
+        0x1b, 0x70, 0x00, 0x19, 0xfa, // pin 2
+        0x1b, 0x70, 0x01, 0x19, 0xfa, // pin 5
+        0x0a, 0x0a,
+    ];
+    bytes.resize(64, 0);
+    bytes
+}
 
 #[derive(Debug, Deserialize)]
 struct PrinterConfig {
@@ -234,7 +241,7 @@ fn handle_client(
                 if !is_valid_cups_name(&cups) {
                     return write_response(&mut stream, 400, "invalid CUPS printer name");
                 }
-                match send_to_cups(&cups, DRAWER_KICK) {
+                match send_to_cups(&cups, &drawer_kick_job()) {
                     Ok(()) => write_response(&mut stream, 200, "drawer"),
                     Err(e) => {
                         log::warn!("cups drawer kick failed: {e}");
@@ -242,7 +249,7 @@ fn handle_client(
                     }
                 }
             } else {
-                match send_to_printer(app_data, DRAWER_KICK) {
+                match send_to_printer(app_data, &drawer_kick_job()) {
                     Ok(()) => write_response(&mut stream, 200, "drawer"),
                     Err(e) => write_response(&mut stream, 500, &e.to_string()),
                 }
@@ -722,6 +729,9 @@ fn send_to_printer(app_data: &Path, data: &[u8]) -> std::io::Result<()> {
             stream.set_write_timeout(Some(Duration::from_secs(10)))?;
             stream.write_all(data)?;
             stream.flush()?;
+            if data.len() < 128 {
+                std::thread::sleep(Duration::from_millis(200));
+            }
             log::info!("sent {} bytes to printer at {addr}", data.len());
             Ok(())
         }
