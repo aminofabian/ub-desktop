@@ -4,6 +4,13 @@
 //! CUPS (`X-Printer-Cups-Name`), network :9100, or a spool file. Cloud cashier in a
 //! browser can also POST here (CORS enabled).
 //!
+//! On Windows there is no CUPS. Queue listing and raw printing go through the
+//! same PowerShell engine the cloud Till Print Bridge ships
+//! (`till-print-bridge-windows.ps1 -ListOnly`, `windows-raw-print.ps1`), bundled
+//! under `resources/print/`. On first run the bridge also picks the suggested
+//! receipt queue and writes `conf/printer.json`, so a USB Xprinter works with
+//! no setup click.
+//!
 //! If the port is busy (typically a stray instance from a previous session), the
 //! thread keeps retrying for [`BIND_RETRY_WINDOW`] and shares the outcome through
 //! a [`BridgeStatus`] handle so the boot path can warn the user instead of the
@@ -124,6 +131,7 @@ fn run_server(
     let addr = format!("127.0.0.1:{DEVICE_PORT}");
     let listener = bind_with_retry(&addr, status)?;
     log::info!("Device bridge listening on http://{addr}");
+    spawn_first_run_printer_pick(app_data.to_path_buf());
 
     for stream in listener.incoming() {
         match stream {
@@ -195,8 +203,21 @@ fn handle_client(
         ("GET", "/health") | ("GET", "/health/") => {
             let platform = health_platform();
             let has_lpstat = lpstat_bin().is_some();
+            let win_engine = if cfg!(windows) && windows_print_engine_dir().is_some() {
+                r#","spooler":true,"powershell":true,"networkRaw":true,"printEngine":"v5-bypass-epson","listEngine":"usb-pnp-v2""#
+            } else {
+                ""
+            };
+            let printer_name = {
+                let cfg = load_config(app_data);
+                if cfg.mode == "cups" && !cfg.cups_name.is_empty() {
+                    format!(r#","printerName":"{}""#, json_escape(&cfg.cups_name))
+                } else {
+                    String::new()
+                }
+            };
             let json = format!(
-                r#"{{"ok":true,"cups":{cups},"lpstat":{lpstat},"platform":"{platform}","port":{port}}}"#,
+                r#"{{"ok":true,"cups":{cups},"lpstat":{lpstat},"platform":"{platform}","port":{port}{win_engine}{printer_name}}}"#,
                 cups = if has_lpstat { "true" } else { "false" },
                 lpstat = if has_lpstat { "true" } else { "false" },
                 platform = platform,
@@ -204,7 +225,7 @@ fn handle_client(
             );
             write_json_response(&mut stream, 200, &json)
         }
-        ("GET", "/printers") | ("GET", "/printers/") => match list_cups_printers_json() {
+        ("GET", "/printers") | ("GET", "/printers/") => match list_printers_json(app_data) {
             Ok(json) => write_json_response(&mut stream, 200, &json),
             Err(e) => {
                 log::warn!("list printers failed: {e}");
@@ -216,10 +237,10 @@ fn handle_client(
                 return write_response(&mut stream, 400, "empty body");
             }
             if let Some(cups) = header_ci(&headers, "x-printer-cups-name") {
-                if !is_valid_cups_name(&cups) {
-                    return write_response(&mut stream, 400, "invalid CUPS printer name");
+                if !is_valid_queue_name(&cups) {
+                    return write_response(&mut stream, 400, "invalid printer name");
                 }
-                match send_to_cups(&cups, &body) {
+                match send_to_queue(app_data, &cups, &body) {
                     Ok(()) => write_response(&mut stream, 200, "printed"),
                     Err(e) => {
                         log::warn!("cups print failed: {e}");
@@ -238,10 +259,10 @@ fn handle_client(
         }
         ("POST", "/drawer/kick") | ("POST", "/drawer/kick/") => {
             if let Some(cups) = header_ci(&headers, "x-printer-cups-name") {
-                if !is_valid_cups_name(&cups) {
-                    return write_response(&mut stream, 400, "invalid CUPS printer name");
+                if !is_valid_queue_name(&cups) {
+                    return write_response(&mut stream, 400, "invalid printer name");
                 }
-                match send_to_cups(&cups, &drawer_kick_job()) {
+                match send_to_queue(app_data, &cups, &drawer_kick_job()) {
                     Ok(()) => write_response(&mut stream, 200, "drawer"),
                     Err(e) => {
                         log::warn!("cups drawer kick failed: {e}");
@@ -327,6 +348,245 @@ fn lpstat_bin() -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Queue names the bridge will hand to the OS. CUPS names are strict; Windows
+/// queue names routinely carry spaces and parentheses ("Xprinter (USB002)"),
+/// so there we only refuse control characters and quoting-sensitive ones.
+fn is_valid_queue_name(name: &str) -> bool {
+    if cfg!(windows) {
+        !name.is_empty()
+            && name.len() <= 120
+            && name
+                .chars()
+                .all(|c| !c.is_control() && c != '"' && c != '\\' && c != ',' && c != '!')
+    } else {
+        is_valid_cups_name(name)
+    }
+}
+
+/// `/printers`: Windows → bundled PowerShell engine; elsewhere → CUPS.
+fn list_printers_json(app_data: &Path) -> std::io::Result<String> {
+    if cfg!(windows) {
+        return windows_list_printers_json(app_data);
+    }
+    list_cups_printers_json()
+}
+
+/// Raw ESC/POS to a named system queue: Windows spooler or CUPS.
+fn send_to_queue(app_data: &Path, name: &str, data: &[u8]) -> std::io::Result<()> {
+    if cfg!(windows) {
+        return windows_send_raw(app_data, name, data);
+    }
+    send_to_cups(name, data)
+}
+
+/// Directory holding `till-print-bridge-windows.ps1` and `windows-raw-print.ps1`.
+/// Bundled as `resources/print/` by tauri.windows.conf.json; overridable with
+/// `APP_DESKTOP_PRINT_ENGINE` for development.
+fn windows_print_engine_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("APP_DESKTOP_PRINT_ENGINE") {
+        let p = PathBuf::from(dir);
+        if p.join("till-print-bridge-windows.ps1").exists() {
+            return Some(p);
+        }
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(bundle) = crate::bundle::bundle_resources_dir() {
+        candidates.push(bundle.join("print"));
+    }
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        candidates.push(exe_dir.join("resources").join("print"));
+        candidates.push(exe_dir.join("print"));
+    }
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("Resources-windows")
+            .join("print"),
+    );
+    candidates
+        .into_iter()
+        .find(|c| c.join("till-print-bridge-windows.ps1").exists())
+}
+
+fn powershell_command() -> Command {
+    let mut exe = PathBuf::from("powershell.exe");
+    if let Ok(root) = std::env::var("SystemRoot") {
+        let full = PathBuf::from(root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if full.exists() {
+            exe = full;
+        }
+    }
+    let mut cmd = Command::new(exe);
+    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
+fn print_engine_log(app_data: &Path) -> PathBuf {
+    app_data.join("logs").join("print-bridge.log")
+}
+
+fn missing_engine() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "Windows print engine (resources/print/till-print-bridge-windows.ps1) is missing from this install",
+    )
+}
+
+/// `till-print-bridge-windows.ps1 -ListOnly`: lists spooler queues, creates a
+/// Generic / Text Only queue for a bare USB receipt printer, and returns the
+/// same JSON the cloud bridge does (`printers`, `suggested`, `defaultName`).
+fn windows_list_printers_json(app_data: &Path) -> std::io::Result<String> {
+    let dir = windows_print_engine_dir().ok_or_else(missing_engine)?;
+    let script = dir.join("till-print-bridge-windows.ps1");
+    let log = print_engine_log(app_data);
+    if let Some(parent) = log.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let out = powershell_command()
+        .arg("-File")
+        .arg(&script)
+        .arg("-ListOnly")
+        .env("TILL_PRINT_BRIDGE_LOG", &log)
+        .current_dir(&dir)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The script logs with Write-Host before the JSON; keep only the JSON.
+    let json = stdout
+        .rfind("{\"ok\":")
+        .map(|i| stdout[i..].trim().to_string())
+        .unwrap_or_default();
+    if json.is_empty() || !json.ends_with('}') {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            if err.is_empty() {
+                "printer list script returned no result".to_string()
+            } else {
+                err
+            },
+        ));
+    }
+    Ok(json)
+}
+
+/// `windows-raw-print.ps1`: raw bytes to a spooler queue (RAW datatype, with
+/// the Epson/ePOS USB bypass the cloud bridge uses).
+fn windows_send_raw(app_data: &Path, name: &str, data: &[u8]) -> std::io::Result<()> {
+    let dir = windows_print_engine_dir().ok_or_else(missing_engine)?;
+    let helper = dir.join("windows-raw-print.ps1");
+    let file = std::env::temp_dir().join(format!(
+        "palmart-escpos-{}-{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    fs::write(&file, data)?;
+    let output = powershell_command()
+        .arg("-File")
+        .arg(&helper)
+        .arg("-PrinterName")
+        .arg(name)
+        .arg("-FilePath")
+        .arg(&file)
+        .env("TILL_PRINT_BRIDGE_LOG", print_engine_log(app_data))
+        .current_dir(&dir)
+        .output();
+    let _ = fs::remove_file(&file);
+    match output {
+        Ok(out) if out.status.success() => {
+            log::info!("sent {} bytes to Windows queue {name}", data.len());
+            Ok(())
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                if err.is_empty() {
+                    format!("print to {name} failed (exit {:?})", out.status.code())
+                } else {
+                    err
+                },
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// First run: no `printer.json` yet → ask the OS for its suggested receipt
+/// queue (Windows spooler via the bundled engine, CUPS elsewhere) and save it
+/// as the till printer. Without this the default `file` mode swallows every
+/// receipt into `receipts.log` while the UI reports "Sent to printer". Runs on
+/// its own thread (driver install can take a while) and never overrides a
+/// saved choice.
+fn spawn_first_run_printer_pick(app_data: PathBuf) {
+    if config_path(&app_data).exists() {
+        return;
+    }
+    thread::spawn(move || match list_printers_json(&app_data) {
+        Ok(json) => {
+            let suggested = serde_json::from_str::<serde_json::Value>(&json)
+                .ok()
+                .and_then(|v| v.get("suggested").and_then(|s| s.as_str()).map(str::to_string))
+                .filter(|s| !s.is_empty() && is_valid_queue_name(s));
+            match suggested {
+                Some(name) => match save_cups_config(&app_data, &name) {
+                    Ok(()) => log::info!("first run: receipt printer set to {name}"),
+                    Err(e) => log::warn!("first run: could not save printer.json: {e}"),
+                },
+                None => log::info!("first run: no receipt printer found yet (Detect later)"),
+            }
+        }
+        Err(e) => log::warn!("first run: printer detection failed: {e}"),
+    });
+}
+
+fn save_cups_config(app_data: &Path, cups_name: &str) -> std::io::Result<()> {
+    let path = config_path(app_data);
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let cfg = serde_json::json!({
+        "mode": "cups",
+        "host": "",
+        "port": 9100,
+        "path": "",
+        "cupsName": cups_name,
+    });
+    fs::write(&path, serde_json::to_string_pretty(&cfg)?)
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn is_valid_cups_name(name: &str) -> bool {
@@ -742,13 +1002,13 @@ fn send_to_printer(app_data: &Path, data: &[u8]) -> std::io::Result<()> {
                     "printer.json: cupsName required for cups mode",
                 ));
             }
-            if !is_valid_cups_name(&cfg.cups_name) {
+            if !is_valid_queue_name(&cfg.cups_name) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "printer.json: invalid CUPS printer name",
+                    "printer.json: invalid printer name",
                 ));
             }
-            send_to_cups(&cfg.cups_name, data)
+            send_to_queue(app_data, &cfg.cups_name, data)
         }
         "file" | _ => {
             let path = if cfg.path.is_empty() {

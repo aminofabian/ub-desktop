@@ -200,12 +200,54 @@ fn admin_conn_args(cfg: &MariadbConfig) -> Vec<String> {
     }
 }
 
+/// "Reset this PC" (backend `POST /desktop/setup/reset`) leaves
+/// `APP_DATA/conf/wipe-on-boot` after taking a backup. Drop the local database
+/// here, before the JVM starts, so Flyway rebuilds an empty till and nothing
+/// of the previous shop survives. The marker is removed only after a
+/// successful drop; a failed drop is retried on the next start.
+fn wipe_database_if_requested(cfg: &MariadbConfig) {
+    let Some(marker) = cfg
+        .pid_file
+        .parent()
+        .map(|app_data| app_data.join("conf").join("wipe-on-boot"))
+    else {
+        return;
+    };
+    if !marker.exists() {
+        return;
+    }
+    log::warn!("Reset requested: dropping the local database ({})", marker.display());
+    let result = mariadb_command(cfg, "mariadb")
+        .args(admin_conn_args(cfg))
+        .arg("-u")
+        .arg("root")
+        .arg("-e")
+        .arg("DROP DATABASE IF EXISTS ub;")
+        .output();
+    match result {
+        Ok(out) if out.status.success() => {
+            if let Err(e) = std::fs::remove_file(&marker) {
+                log::error!("Database dropped but the reset marker could not be removed: {e}");
+            } else {
+                log::info!("Local database dropped; a fresh one will be created.");
+            }
+        }
+        Ok(out) => log::error!(
+            "Reset: DROP DATABASE failed, will retry next start: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => log::error!("Reset: could not run the mariadb client: {e}"),
+    }
+}
+
 /// Bring the `ub` database + `ub_local` user up to spec. Safe to re-run.
 fn ensure_schema(cfg: &MariadbConfig) -> io::Result<()> {
     // Connect via socket as root (no password — `mariadb-install-db
     // --auth-root-authentication-method=normal` leaves root passwordless for
     // local socket access, which is fine since the socket lives inside
     // APP_DATA with 0600 permissions).
+    wipe_database_if_requested(cfg);
+
     let bootstrap = format!(
         "CREATE DATABASE IF NOT EXISTS ub CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n\
          CREATE USER IF NOT EXISTS '{user}'@'127.0.0.1' IDENTIFIED BY '{pw}';\n\

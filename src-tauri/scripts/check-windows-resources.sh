@@ -13,6 +13,8 @@ missing=()
 [[ -f "$RES/jre/bin/java.exe" ]] || missing+=("jre/bin/java.exe")
 [[ -f "$RES/mariadb/bin/mariadbd.exe" ]] || missing+=("mariadb/bin/mariadbd.exe")
 [[ -f "$RES/config/application.properties" ]] || missing+=("config/application.properties")
+[[ -f "$RES/print/till-print-bridge-windows.ps1" ]] || missing+=("print/till-print-bridge-windows.ps1")
+[[ -f "$RES/print/windows-raw-print.ps1" ]] || missing+=("print/windows-raw-print.ps1")
 
 # The Tauri splash (frontendDist) is embedded into the EXE at build time from
 # desktop/dist/. If it is missing the build succeeds but the window renders

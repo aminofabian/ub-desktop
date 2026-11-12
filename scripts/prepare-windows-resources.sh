@@ -121,6 +121,16 @@ rm -rf "$RES/mariadb/lib/debug" "$RES/mariadb/include" 2>/dev/null || true
 chmod -R u+w "$RES"
 rm -f "$RES"/jre/bin/server/classes.jsa "$RES"/jre/bin/server/classes_nocoops.jsa
 
+# Windows print engine: the device bridge (src-tauri/src/devices.rs) lists
+# spooler queues and prints raw ESC/POS through the same PowerShell scripts the
+# cloud Till Print Bridge ships, so USB receipt printers work with no CUPS.
+PRINT_SRC="$ROOT/frontend/scripts"
+mkdir -p "$RES/print"
+for f in till-print-bridge-windows.ps1 windows-raw-print.ps1; do
+  [[ -f "$PRINT_SRC/$f" ]] || { echo "error: $PRINT_SRC/$f missing (print engine)" >&2; exit 1; }
+  cp "$PRINT_SRC/$f" "$RES/print/$f"
+done
+
 rm -rf "$STAGE"
 
 echo "   JRE:     $(du -sh "$RES/jre" | cut -f1)"
