@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Install a LaunchAgent so Palmart Desktop starts at login (§12 optional).
+# Install a LaunchAgent so Kiosk Desktop starts at login (§12 optional).
 #
 # Usage:
-#   ./desktop/scripts/install-macos-launch-agent.sh /Applications/Palmart.app
+#   ./desktop/scripts/install-macos-launch-agent.sh "/Applications/Kiosk Desktop.app"
 
 set -euo pipefail
 
-APP="${1:?Pass path to Palmart.app}"
+APP="${1:?Pass path to Kiosk Desktop.app}"
 PLIST="$HOME/Library/LaunchAgents/com.palmart.desktop.plist"
 EXEC="$APP/Contents/MacOS/kiosk-desktop"
 
@@ -37,4 +37,4 @@ EOF
 
 launchctl unload "$PLIST" 2>/dev/null || true
 launchctl load "$PLIST"
-echo "Installed $PLIST — Palmart will start at login."
+echo "Installed $PLIST — Kiosk Desktop will start at login."

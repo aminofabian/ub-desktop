@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,6 +61,101 @@ fn drawer_kick_job() -> Vec<u8> {
     ];
     bytes.resize(64, 0);
     bytes
+}
+
+/// ESC/POS GS r 2. Bit 0 of the reply is drawer-kick connector pin 3.
+const DRAWER_STATUS_COMMAND: [u8; 3] = [0x1d, 0x72, 0x02];
+const DRAWER_STATUS_TIMEOUT: Duration = Duration::from_millis(1200);
+
+fn pin_high(raw: u8) -> bool {
+    raw & 0x01 == 0x01
+}
+
+fn valid_printer_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
+}
+
+fn query_drawer_pin(host: &str, port: u16) -> std::io::Result<u8> {
+    if !valid_printer_host(host) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid printer host",
+        ));
+    }
+    let addr = format!("{host}:{port}")
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "printer host did not resolve",
+            )
+        })?;
+    let mut stream = TcpStream::connect_timeout(&addr, DRAWER_STATUS_TIMEOUT)?;
+    stream.set_read_timeout(Some(DRAWER_STATUS_TIMEOUT))?;
+    stream.set_write_timeout(Some(DRAWER_STATUS_TIMEOUT))?;
+    stream.write_all(&DRAWER_STATUS_COMMAND)?;
+    stream.flush()?;
+    let mut buf = [0u8; 1];
+    stream.read_exact(&mut buf)?;
+    Ok(buf[0])
+}
+
+fn status_readable(raw: u8) -> String {
+    format!(
+        r#"{{"readable":true,"pinHigh":{},"raw":{}}}"#,
+        pin_high(raw),
+        raw
+    )
+}
+
+fn header_port(headers: &HashMap<String, String>) -> u16 {
+    header_ci(headers, "x-printer-port")
+        .and_then(|raw| raw.parse().ok())
+        .filter(|port: &u16| *port > 0)
+        .unwrap_or(9100)
+}
+
+fn write_drawer_status(
+    stream: &mut TcpStream,
+    app_data: &Path,
+    headers: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    let host_header = header_ci(headers, "x-printer-host").unwrap_or_default();
+    let host = host_header.trim();
+    if !host.is_empty() {
+        if !valid_printer_host(host) {
+            return write_response(stream, 400, "Invalid X-Printer-Host");
+        }
+        return write_pin(stream, host, header_port(headers));
+    }
+    if header_ci(headers, "x-printer-cups-name").is_some() {
+        return write_json_response(stream, 200, r#"{"readable":false,"reason":"queue"}"#);
+    }
+    let cfg = load_config(app_data);
+    if cfg.mode == "network" && valid_printer_host(cfg.host.trim()) {
+        return write_pin(stream, cfg.host.trim(), cfg.port);
+    }
+    let reason = if cfg.mode == "cups" { "queue" } else { "no-printer" };
+    write_json_response(
+        stream,
+        200,
+        &format!(r#"{{"readable":false,"reason":"{reason}"}}"#),
+    )
+}
+
+fn write_pin(stream: &mut TcpStream, host: &str, port: u16) -> std::io::Result<()> {
+    match query_drawer_pin(host, port) {
+        Ok(raw) => write_json_response(stream, 200, &status_readable(raw)),
+        Err(e) => {
+            log::warn!("drawer status unreadable: {e}");
+            write_json_response(stream, 200, r#"{"readable":false,"reason":"timeout"}"#)
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,6 +351,9 @@ fn handle_client(
                     }
                 }
             }
+        }
+        ("POST", "/drawer/status") | ("POST", "/drawer/status/") => {
+            write_drawer_status(&mut stream, app_data, &headers)
         }
         ("POST", "/drawer/kick") | ("POST", "/drawer/kick/") => {
             if let Some(cups) = header_ci(&headers, "x-printer-cups-name") {
@@ -488,7 +586,7 @@ fn windows_send_raw(app_data: &Path, name: &str, data: &[u8]) -> std::io::Result
     let dir = windows_print_engine_dir().ok_or_else(missing_engine)?;
     let helper = dir.join("windows-raw-print.ps1");
     let file = std::env::temp_dir().join(format!(
-        "palmart-escpos-{}-{}.bin",
+        "kiosk-escpos-{}-{}.bin",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -760,7 +858,7 @@ fn send_to_cups(name: &str, data: &[u8]) -> std::io::Result<()> {
     };
 
     let file = std::env::temp_dir().join(format!(
-        "palmart-escpos-{}-{}.bin",
+        "kiosk-escpos-{}-{}.bin",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1025,5 +1123,26 @@ fn send_to_printer(app_data: &Path, data: &[u8]) -> std::io::Result<()> {
             log::info!("appended {} bytes to {}", data.len(), path.display());
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod drawer_status_tests {
+    use super::{pin_high, valid_printer_host};
+
+    #[test]
+    fn pin_high_is_bit_0() {
+        assert!(!pin_high(0x00));
+        assert!(pin_high(0x01));
+        assert!(pin_high(0x11));
+    }
+
+    #[test]
+    fn printer_host_rejects_blanks_and_spaces() {
+        assert!(valid_printer_host("192.168.1.20"));
+        assert!(valid_printer_host("printer.local"));
+        assert!(!valid_printer_host(""));
+        assert!(!valid_printer_host("192.168.1.20/raw"));
+        assert!(!valid_printer_host("bad host"));
     }
 }

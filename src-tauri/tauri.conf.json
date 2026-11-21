@@ -34,7 +34,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "copyright": "© Palmart",
+    "copyright": "© Kiosk",
     "macOS": {
       "minimumSystemVersion": "10.15",
       "exceptionDomain": "127.0.0.1",

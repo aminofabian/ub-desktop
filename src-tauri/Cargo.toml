@@ -4,8 +4,8 @@ name = "kiosk-desktop"
 # shell's kiosk.log prints this version, so a stale value here makes support
 # logs claim the wrong release.
 version = "0.0.25"
-description = "Palmart for desktop — thin Tauri shell over Spring Boot + MariaDB."
-authors = ["Palmart"]
+description = "Kiosk for desktop — thin Tauri shell over Spring Boot + MariaDB."
+authors = ["Kiosk"]
 license = "Proprietary"
 edition = "2021"
 rust-version = "1.77"
